@@ -3,15 +3,19 @@ import { Canvas, useFrame } from "@react-three/fiber";
 import { Text, Stars, PerspectiveCamera } from "@react-three/drei";
 import * as THREE from "three";
 
-// ---------------- CONFIG ----------------
+// ================= CONFIG =================
 const PLAYER_SPEED = 0.22;
 const TALK_RADIUS = 2.2;
 
-// ---------------- DIALOGUE ----------------
+const CHUNK_SIZE = 20;
+const VIEW_RADIUS = 2; // how many chunks around player
+const WORLD_LIMIT = 8; // soft boundary in chunks
+
+// ================= DIALOGUE =================
 const DIALOGUE = {
   dreamer: [
     "I keep imagining better versions of today.",
-    "Somewhere, a softer world exists. I think we’re building it slowly.",
+    "Somewhere, a softer world exists.",
     "I wanted to be a cloud once. This is close enough."
   ],
   cynic: [
@@ -36,25 +40,119 @@ const DIALOGUE = {
   ]
 };
 
-// ---------------- WORLD ----------------
-const Ground = () => (
-  <mesh rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
-    <planeGeometry args={[200, 200]} />
-    <meshStandardMaterial color="#334155" />
-  </mesh>
-);
+const NPC_TYPES = Object.keys(DIALOGUE);
 
-const Building = ({ pos }) => (
-  <mesh position={[pos[0], 2, pos[1]]} castShadow>
-    <boxGeometry args={[4, 4, 4]} />
+// ================= UTILS =================
+function hash(x, z) {
+  return `${x},${z}`;
+}
+
+function seededRand(seed) {
+  let s = seed * 99991;
+  return () => {
+    s = Math.sin(s) * 10000;
+    return s - Math.floor(s);
+  };
+}
+
+// ================= WORLD PIECES =================
+const GroundTile = ({ x, z, type }) => {
+  const color =
+    type === "park" ? "#14532d" :
+    type === "plaza" ? "#4b5563" :
+    "#1f2933";
+
+  return (
+    <mesh position={[x, -0.01, z]} rotation={[-Math.PI / 2, 0, 0]} receiveShadow>
+      <planeGeometry args={[CHUNK_SIZE, CHUNK_SIZE]} />
+      <meshStandardMaterial color={color} />
+    </mesh>
+  );
+};
+
+const Building = ({ x, z, h }) => (
+  <mesh position={[x, h / 2, z]} castShadow receiveShadow>
+    <boxGeometry args={[2 + Math.random(), h, 2 + Math.random()]} />
     <meshStandardMaterial color="#1e293b" />
   </mesh>
 );
 
-// ---------------- PLAYER ----------------
+// ================= NPC =================
+const NPC = ({ pos, type, playerPos }) => {
+  const ref = useRef();
+  const [line] = useState(
+    () => DIALOGUE[type][Math.floor(Math.random() * DIALOGUE[type].length)]
+  );
+  const [talking, setTalking] = useState(false);
+
+  useFrame(() => {
+    if (!ref.current) return;
+    const npcPos = ref.current.position;
+    const p = new THREE.Vector3(...playerPos);
+    const d = npcPos.distanceTo(p);
+
+    if (d < TALK_RADIUS) {
+      setTalking(true);
+      ref.current.lookAt(p.x, npcPos.y, p.z);
+    } else {
+      setTalking(false);
+    }
+  });
+
+  return (
+    <group ref={ref} position={[pos[0], 0, pos[1]]}>
+      <mesh position={[0, 0.8, 0]}>
+        <capsuleGeometry args={[0.3, 1, 4, 16]} />
+        <meshStandardMaterial color="#0ea5e9" />
+      </mesh>
+
+      {talking && (
+        <Text position={[0, 2.3, 0]} fontSize={0.28} color="white" maxWidth={4}>
+          {line}
+        </Text>
+      )}
+    </group>
+  );
+};
+
+// ================= CHUNK GENERATOR =================
+function generateChunk(cx, cz) {
+  const rand = seededRand(cx * 10007 + cz * 30011);
+  const biome =
+    rand() > 0.85 ? "park" :
+    rand() > 0.7 ? "plaza" :
+    "street";
+
+  const buildings = [];
+  const npcs = [];
+
+  if (biome === "street" || biome === "plaza") {
+    const count = 6 + Math.floor(rand() * 6);
+    for (let i = 0; i < count; i++) {
+      buildings.push({
+        x: (rand() - 0.5) * CHUNK_SIZE + cx * CHUNK_SIZE,
+        z: (rand() - 0.5) * CHUNK_SIZE + cz * CHUNK_SIZE,
+        h: 3 + rand() * 6
+      });
+    }
+  }
+
+  const npcCount = 1 + Math.floor(rand() * 3);
+  for (let i = 0; i < npcCount; i++) {
+    npcs.push({
+      pos: [
+        (rand() - 0.5) * CHUNK_SIZE + cx * CHUNK_SIZE,
+        (rand() - 0.5) * CHUNK_SIZE + cz * CHUNK_SIZE
+      ],
+      type: NPC_TYPES[Math.floor(rand() * NPC_TYPES.length)]
+    });
+  }
+
+  return { cx, cz, biome, buildings, npcs };
+}
+// ================= PLAYER =================
 const Player = ({ position, rotation, moving }) => {
   const body = useRef();
-
   useFrame((state) => {
     if (moving && body.current) {
       body.current.position.y = Math.abs(Math.sin(state.clock.elapsedTime * 10)) * 0.15;
@@ -77,50 +175,7 @@ const Player = ({ position, rotation, moving }) => {
   );
 };
 
-// ---------------- NPC ----------------
-const NPC = ({ pos, type, playerPos }) => {
-  const ref = useRef();
-  const [target] = useState(() => new THREE.Vector3(
-    pos[0] + (Math.random() - 0.5) * 6,
-    0,
-    pos[1] + (Math.random() - 0.5) * 6
-  ));
-  const [line] = useState(() => DIALOGUE[type][Math.floor(Math.random() * DIALOGUE[type].length)]);
-  const [talking, setTalking] = useState(false);
-
-  useFrame(() => {
-    if (!ref.current) return;
-
-    const npcPos = ref.current.position;
-    const p = new THREE.Vector3(...playerPos);
-    const d = npcPos.distanceTo(p);
-
-    if (d < TALK_RADIUS) {
-      setTalking(true);
-      ref.current.lookAt(p.x, npcPos.y, p.z);
-    } else {
-      setTalking(false);
-      npcPos.lerp(target, 0.005);
-    }
-  });
-
-  return (
-    <group ref={ref} position={[pos[0], 0, pos[1]]}>
-      <mesh position={[0, 0.8, 0]}>
-        <capsuleGeometry args={[0.3, 1, 4, 16]} />
-        <meshStandardMaterial color="#0ea5e9" />
-      </mesh>
-
-      {talking && (
-        <Text position={[0, 2.3, 0]} fontSize={0.28} color="white" maxWidth={4}>
-          {line}
-        </Text>
-      )}
-    </group>
-  );
-};
-
-// ---------------- JOYSTICK ----------------
+// ================= JOYSTICK =================
 const Joystick = ({ onInput }) => {
   const stick = useRef();
   const center = useRef({ x: 0, y: 0 });
@@ -162,51 +217,92 @@ const Joystick = ({ onInput }) => {
   );
 };
 
-// ---------------- APP ----------------
+// ================= APP =================
 export default function App() {
   const [pos, setPos] = useState([0, 0, 0]);
   const [rot, setRot] = useState(0);
   const [input, setInput] = useState({ x: 0, y: 0 });
 
-  const npcs = useMemo(() => ([
-    { pos: [3, 3], type: "dreamer" },
-    { pos: [-4, 2], type: "cynic" },
-    { pos: [6, -5], type: "worker" },
-    { pos: [-6, -4], type: "wanderer" },
-    { pos: [1, -7], type: "optimist" }
-  ]), []);
+  const chunksRef = useRef(new Map());
+  const [, force] = useState(0);
+
+  const getChunk = (cx, cz) => {
+    const k = hash(cx, cz);
+    if (!chunksRef.current.has(k)) {
+      chunksRef.current.set(k, generateChunk(cx, cz));
+    }
+    return chunksRef.current.get(k);
+  };
+
+  const updateChunks = () => {
+    const cx = Math.floor(pos[0] / CHUNK_SIZE);
+    const cz = Math.floor(pos[2] / CHUNK_SIZE);
+
+    const keep = new Set();
+    for (let x = -VIEW_RADIUS; x <= VIEW_RADIUS; x++) {
+      for (let z = -VIEW_RADIUS; z <= VIEW_RADIUS; z++) {
+        const k = hash(cx + x, cz + z);
+        keep.add(k);
+        getChunk(cx + x, cz + z);
+      }
+    }
+
+    for (const k of chunksRef.current.keys()) {
+      if (!keep.has(k)) chunksRef.current.delete(k);
+    }
+    force(v => v + 1);
+  };
 
   const GameLoop = () => {
     useFrame((state) => {
       if (input.x || input.y) {
         const a = Math.atan2(input.x, input.y);
         setRot(a);
-        const nx = pos[0] + input.x * PLAYER_SPEED;
-        const nz = pos[2] + input.y * PLAYER_SPEED;
+
+        let nx = pos[0] + input.x * PLAYER_SPEED;
+        let nz = pos[2] + input.y * PLAYER_SPEED;
+
+        // Soft world boundary
+        const limit = WORLD_LIMIT * CHUNK_SIZE;
+        nx = THREE.MathUtils.clamp(nx, -limit, limit);
+        nz = THREE.MathUtils.clamp(nz, -limit, limit);
+
         setPos([nx, 0, nz]);
+
         state.camera.position.x = nx;
         state.camera.position.z = nz + 16;
         state.camera.lookAt(nx, 0, nz);
+
+        updateChunks();
       }
     });
     return null;
   };
 
+  const chunks = Array.from(chunksRef.current.values());
+
   return (
     <div style={{ position: "fixed", inset: 0 }}>
-      <Canvas shadows>
+      <Canvas shadows fog={{ color: "#0f172a", near: 20, far: 90 }}>
         <PerspectiveCamera makeDefault position={[0, 15, 16]} />
         <ambientLight intensity={0.8} />
         <directionalLight position={[10, 20, 10]} intensity={1.5} />
-        <Stars radius={80} depth={40} count={1500} factor={4} />
+        <Stars radius={120} depth={60} count={1800} factor={4} />
 
-        <Ground />
-        {[...Array(20)].map((_, i) => (
-          <Building key={i} pos={[(Math.random() - 0.5) * 40, (Math.random() - 0.5) * 40]} />
-        ))}
-
-        {npcs.map((n, i) => (
-          <NPC key={i} pos={n.pos} type={n.type} playerPos={pos} />
+        {chunks.map((c) => (
+          <group key={hash(c.cx, c.cz)}>
+            <GroundTile
+              x={c.cx * CHUNK_SIZE}
+              z={c.cz * CHUNK_SIZE}
+              type={c.biome}
+            />
+            {c.buildings.map((b, i) => (
+              <Building key={i} x={b.x} z={b.z} h={b.h} />
+            ))}
+            {c.npcs.map((n, i) => (
+              <NPC key={i} pos={n.pos} type={n.type} playerPos={pos} />
+            ))}
+          </group>
         ))}
 
         <Player position={pos} rotation={rot} moving={input.x || input.y} />
