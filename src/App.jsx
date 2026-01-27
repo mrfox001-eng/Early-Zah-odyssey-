@@ -1,553 +1,613 @@
-import React, { useState, useRef, useEffect, useMemo } from 'react';
+import React, { useState, useRef, useEffect, useMemo, useCallback } from 'react';
 import { Canvas, useFrame, useThree } from '@react-three/fiber';
-import { OrbitControls, Text, Float, Stars, Trail, MeshDistortMaterial, Sparkles, PerspectiveCamera } from '@react-three/drei';
+import { Text, Float, Stars, Trail, MeshDistortMaterial, Sparkles, PerspectiveCamera, RoundedBox, useTexture } from '@react-three/drei';
 import * as THREE from 'three';
-import { ShoppingBag, MessageCircle, Package, MapPin, Zap, ArrowUp } from 'lucide-react';
+import { ShoppingBag, MapPin, Zap, Timer, AlertTriangle, ArrowUp } from 'lucide-react';
 
-// --- CONSTANTS ---
-const MOVEMENT_SPEED = 0.15;
-const CAT_FOLLOW_SPEED = 0.08;
-const INTERACTION_DIST = 3.5; // Distance to trigger interact button
+// --- GAME SETTINGS ---
+const PLAYER_SPEED = 0.18;
+const CITY_SIZE = 60;
+const BUILDING_COUNT = 40;
+const CAR_SPEED = 0.25;
 
+// --- ASSETS & DATA ---
 const COLORS = {
-  groundA: "#2e1065", // Dark purple
-  groundB: "#ec4899", // Pink
-  sky: "#0f172a"
+  neonPink: "#ff00ff",
+  neonBlue: "#00ffff",
+  road: "#1a1a1a",
+  buildingDark: "#0f172a",
+  buildingLight: "#1e293b",
+  grass: "#059669"
 };
 
-// --- GAME DATA ---
-const NPC_DATA = [
-  { id: 'elder', position: [8, 0, 8], color: '#10b981', label: 'Elder Tree', type: 'npc' },
-  { id: 'monolith', position: [-8, 1, -8], color: '#3b82f6', label: 'Data Monolith', type: 'puzzle' },
-  { id: 'rock', position: [8, 1, -8], color: '#f59e0b', label: 'Floating Rock', type: 'landmark' },
-  { id: 'parcel_spawn', position: [-5, 0.5, 5], color: '#ec4899', label: 'Lost Parcel', type: 'item', hidden: true },
+const MISSIONS = [
+  { 
+    id: 1, 
+    title: "The Glitch Courier", 
+    desc: "A critical package is hidden behind the Neon Tower. Find it!", 
+    type: 'find', 
+    targetPos: [15, 0.5, -15], 
+    reward: 100 
+  },
+  { 
+    id: 2, 
+    title: "Traffic Dodger", 
+    desc: "Collect the Energy Orb on the main road without getting hit!", 
+    type: 'danger', 
+    targetPos: [0, 0.5, 12], 
+    reward: 200 
+  },
+  { 
+    id: 3, 
+    title: "Elder's Request", 
+    desc: "Visit the Elder Tree in the Park Sector.", 
+    type: 'visit', 
+    targetPos: [-18, 0, -18], 
+    reward: 50 
+  }
 ];
 
-const SHOP_ITEMS = [
-  { id: 'skin_neon', name: 'Neon Suit', cost: 100, color: '#00ffcc' },
-  { id: 'skin_gold', name: 'Royal Gold', cost: 200, color: '#ffcc00' },
-  { id: 'fortune', name: 'Fortune Cookie', cost: 20, type: 'consumable' },
-];
+// --- UTILS ---
+// Simple collision check between player and boxes
+const checkCollision = (newPos, buildings) => {
+    // City boundary check
+    if (Math.abs(newPos[0]) > CITY_SIZE/2 || Math.abs(newPos[2]) > CITY_SIZE/2) return true;
 
-const FORTUNES = [
-  "The cat sees what you cannot.",
-  "Turn left at the next glitch.",
-  "Your code is clean, your path is clear.",
-  "A bug is just a feature waiting to be discovered."
-];
-
-const PUZZLE_SEQUENCE = ['red', 'green', 'blue', 'red'];
+    // Building check
+    for (let b of buildings) {
+        const dx = Math.abs(newPos[0] - b.position[0]);
+        const dz = Math.abs(newPos[2] - b.position[2]);
+        // Simple AABB collision (Player radius approx 0.5, Building width/depth varies)
+        if (dx < (b.size[0]/2 + 0.3) && dz < (b.size[2]/2 + 0.3)) {
+            return true;
+        }
+    }
+    return false;
+};
 
 // --- SHADERS ---
-const terrainVertexShader = `
+const roadFragmentShader = `
   varying vec2 vUv;
+  uniform float uTime;
   void main() {
-    vUv = uv;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
-  }
-`;
-
-const terrainFragmentShader = `
-  uniform vec3 colorA;
-  uniform vec3 colorB;
-  uniform float time;
-  varying vec2 vUv;
-  void main() {
-    float grid = step(0.95, fract(vUv.x * 20.0)) + step(0.95, fract(vUv.y * 20.0));
-    float wave = sin(vUv.x * 10.0 + time) * 0.1 + cos(vUv.y * 10.0 + time * 0.5) * 0.1;
-    vec3 color = mix(colorA, colorB, vUv.y + wave);
-    vec3 finalColor = mix(color, vec3(1.0), grid * 0.2);
-    gl_FragColor = vec4(finalColor, 1.0);
+    float dash = step(0.5, fract(vUv.y * 20.0 + uTime * 2.0)) * step(0.45, vUv.x) * step(vUv.x, 0.55);
+    vec3 color = mix(vec3(0.1), vec3(1.0, 1.0, 0.0), dash);
+    gl_FragColor = vec4(color, 1.0);
   }
 `;
 
 // --- 3D COMPONENTS ---
 
-function Terrain() {
-  const mesh = useRef();
-  const uniforms = useMemo(() => ({
-    time: { value: 0 },
-    colorA: { value: new THREE.Color(COLORS.groundA) },
-    colorB: { value: new THREE.Color(COLORS.groundB) }
-  }), []);
-
-  useFrame((state) => {
-    if(mesh.current) {
-        mesh.current.material.uniforms.time.value = state.clock.getElapsedTime() * 0.5;
-    }
-  });
-
-  return (
-    <mesh ref={mesh} rotation={[-Math.PI / 2, 0, 0]} position={[0, -1, 0]} receiveShadow>
-      <planeGeometry args={[100, 100, 64, 64]} />
-      <shaderMaterial 
-        vertexShader={terrainVertexShader} 
-        fragmentShader={terrainFragmentShader} 
-        uniforms={uniforms} 
-      />
-    </mesh>
-  );
-}
-
-function Player({ position, color, isCarrying }) {
-  return (
-    <group position={position}>
-      <Float speed={2} rotationIntensity={0.2} floatIntensity={0.5}>
-        {/* Body */}
-        <mesh castShadow position={[0, 0.5, 0]}>
-          <capsuleGeometry args={[0.3, 0.8, 4, 16]} />
-          <meshStandardMaterial color={color} roughness={0.3} metalness={0.8} />
-        </mesh>
-        {/* Head */}
-        <mesh castShadow position={[0, 1.1, 0]}>
-          <sphereGeometry args={[0.35, 32, 32]} />
-          <meshStandardMaterial color="#ffdecb" />
-        </mesh>
-        {/* Hair/Visor */}
-        <mesh position={[0, 1.15, 0.2]}>
-            <boxGeometry args={[0.4, 0.1, 0.2]} />
-            <meshStandardMaterial color="#111" />
-        </mesh>
-        
-        {/* Visual Inventory: Carrying the parcel */}
-        {isCarrying && (
-            <group position={[0, 1.5, 0]}>
-                <mesh castShadow>
-                    <boxGeometry args={[0.4, 0.4, 0.4]} />
-                    <meshStandardMaterial color="#ec4899" emissive="#ec4899" emissiveIntensity={0.5} />
-                </mesh>
-                <Sparkles count={5} scale={1} color="#fff" />
-            </group>
-        )}
-      </Float>
-      <pointLight intensity={1} distance={5} color={color} />
-    </group>
-  );
-}
-
-function AICat({ targetPos }) {
-  const catRef = useRef();
-  
-  useFrame(() => {
-    if (catRef.current) {
-      const targetX = targetPos[0] - 1.5;
-      const targetZ = targetPos[2] - 1.5;
-      catRef.current.position.x = THREE.MathUtils.lerp(catRef.current.position.x, targetX, CAT_FOLLOW_SPEED);
-      catRef.current.position.z = THREE.MathUtils.lerp(catRef.current.position.z, targetZ, CAT_FOLLOW_SPEED);
-      catRef.current.position.y = Math.sin(Date.now() * 0.005) * 0.2 + 0.5;
-      catRef.current.lookAt(targetPos[0], targetPos[1], targetPos[2]);
-    }
-  });
-
-  return (
-    <group ref={catRef} position={[2, 1, 2]}>
-      <Trail width={0.3} length={6} color="#00ffff" attenuation={(t) => t * t}>
-        <mesh>
-          <sphereGeometry args={[0.25, 16, 16]} />
-          <meshStandardMaterial color="#00ffff" emissive="#00ffff" emissiveIntensity={2} />
-        </mesh>
-      </Trail>
-      <mesh position={[0.15, 0.2, 0]}>
-        <coneGeometry args={[0.08, 0.2, 16]} />
-        <meshStandardMaterial color="#00ffff" />
-      </mesh>
-      <mesh position={[-0.15, 0.2, 0]}>
-        <coneGeometry args={[0.08, 0.2, 16]} />
-        <meshStandardMaterial color="#00ffff" />
-      </mesh>
-    </group>
-  );
-}
-
-function WorldObject({ data, isVisible }) {
-    if (!isVisible && data.hidden) return null;
-
+// 1. THE CITY (Procedural Buildings & Roads)
+const City = ({ buildings }) => {
     return (
-        <group position={data.position}>
-            <Text position={[0, 3, 0]} fontSize={0.5} color="white" anchorX="center" anchorY="middle">
-                {data.label}
-            </Text>
-            <Float floatIntensity={1} speed={2}>
-                <mesh castShadow>
-                    {data.type === 'npc' && <torusKnotGeometry args={[0.8, 0.2, 100, 16]} />}
-                    {data.type === 'puzzle' && <boxGeometry args={[1.5, 3, 1.5]} />}
-                    {data.type === 'landmark' && <dodecahedronGeometry args={[1]} />}
-                    {data.type === 'item' && <boxGeometry args={[0.6, 0.6, 0.6]} />}
-                    <MeshDistortMaterial color={data.color} speed={3} distort={0.4} />
-                </mesh>
-            </Float>
-            <Sparkles count={15} scale={3} size={2} speed={0.4} opacity={0.5} color={data.color} />
-            <mesh rotation={[-Math.PI/2, 0, 0]} position={[0, -1, 0]}>
-                <ringGeometry args={[1.5, 1.6, 32]} />
-                <meshBasicMaterial color={data.color} transparent opacity={0.5} />
+        <group>
+            {/* Ground / Floor */}
+            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.1, 0]} receiveShadow>
+                <planeGeometry args={[CITY_SIZE, CITY_SIZE]} />
+                <meshStandardMaterial color="#111" roughness={0.8} />
             </mesh>
-        </group>
-    );
-}
+            
+            {/* Roads (Cross shape) */}
+            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.05, 0]}>
+                <planeGeometry args={[8, CITY_SIZE]} />
+                <meshStandardMaterial color="#222" />
+            </mesh>
+            <mesh rotation={[-Math.PI / 2, 0, 0]} position={[0, -0.04, 0]}>
+                <planeGeometry args={[CITY_SIZE, 8]} />
+                <meshStandardMaterial color="#222" />
+            </mesh>
 
-const WaypointArrow = ({ playerPos, targetPos }) => {
-    const ref = useRef();
-    useFrame(({ clock }) => {
-        if (ref.current && targetPos) {
-            ref.current.position.set(playerPos[0], playerPos[1] + 2.5, playerPos[2]);
-            ref.current.lookAt(targetPos[0], targetPos[1], targetPos[2]);
-            // Point down at player but rotate towards target logic is complex, simpler: float above player
-            // Actually, let's make it float above player and point to target
-             ref.current.lookAt(targetPos[0], targetPos[1] + 2.5, targetPos[2]);
-        }
-    });
-    
-    if(!targetPos) return null;
-
-    return (
-        <group ref={ref}>
-            <group rotation={[0, 0, 0]}> 
-                 <mesh position={[0, 0, 1]} rotation={[Math.PI/2, 0, 0]}>
-                    <coneGeometry args={[0.2, 0.8, 8]} />
-                    <meshBasicMaterial color="#ffff00" depthTest={false} transparent opacity={0.8} />
-                 </mesh>
-            </group>
+            {/* Buildings */}
+            {buildings.map((b, i) => (
+                <group key={i} position={b.position}>
+                    <RoundedBox args={b.size} radius={0.1} receiveShadow castShadow>
+                        <meshStandardMaterial 
+                            color={b.color} 
+                            emissive={b.emissive} 
+                            emissiveIntensity={b.emissiveIntensity || 0}
+                            roughness={0.2}
+                        />
+                    </RoundedBox>
+                    {/* Windows / Detail */}
+                    {Math.random() > 0.5 && (
+                        <mesh position={[0, 0, b.size[2]/2 + 0.01]}>
+                            <planeGeometry args={[b.size[0]*0.8, b.size[1]*0.8]} />
+                            <meshStandardMaterial color="black" emissive={b.color} emissiveIntensity={2} />
+                        </mesh>
+                    )}
+                </group>
+            ))}
         </group>
     );
 };
 
-// --- UI COMPONENT: JOYSTICK ---
+// 2. PLAYER CONTROLLER
+const Player = ({ position, rotation, isMoving }) => {
+    return (
+        <group position={position} rotation={[0, rotation, 0]}>
+             <group position={[0, 0.7, 0]}>
+                {/* Character Model */}
+                <Float speed={isMoving ? 10 : 2} rotationIntensity={isMoving ? 0.5 : 0.1} floatIntensity={isMoving ? 0.2 : 0.5}>
+                    {/* Body */}
+                    <mesh castShadow position={[0, -0.2, 0]}>
+                        <capsuleGeometry args={[0.25, 0.6, 4, 16]} />
+                        <meshStandardMaterial color="#ec4899" />
+                    </mesh>
+                    {/* Skirt */}
+                    <mesh position={[0, -0.5, 0]}>
+                        <coneGeometry args={[0.4, 0.4, 32]} />
+                        <meshStandardMaterial color="#db2777" />
+                    </mesh>
+                    {/* Head */}
+                    <mesh position={[0, 0.4, 0]}>
+                        <sphereGeometry args={[0.28, 32, 32]} />
+                        <meshStandardMaterial color="#ffdecb" />
+                    </mesh>
+                    {/* Hair */}
+                    <mesh position={[0, 0.45, -0.1]}>
+                        <boxGeometry args={[0.55, 0.55, 0.5]} />
+                        <meshStandardMaterial color="#4c1d95" />
+                    </mesh>
+                    {/* Eyes */}
+                    <mesh position={[0.1, 0.45, 0.25]}>
+                        <sphereGeometry args={[0.05]} />
+                        <meshStandardMaterial color="black" />
+                    </mesh>
+                    <mesh position={[-0.1, 0.45, 0.25]}>
+                        <sphereGeometry args={[0.05]} />
+                        <meshStandardMaterial color="black" />
+                    </mesh>
+                </Float>
+             </group>
+             {/* Shadow Blob */}
+             <mesh rotation={[-Math.PI/2, 0, 0]} position={[0, 0.1, 0]}>
+                 <circleGeometry args={[0.4, 32]} />
+                 <meshBasicMaterial color="black" transparent opacity={0.3} />
+             </mesh>
+             <pointLight intensity={0.5} color="#ec4899" distance={3} />
+        </group>
+    );
+};
 
-function Joystick({ onMove }) {
-  const [active, setActive] = useState(false);
-  const [pos, setPos] = useState({ x: 0, y: 0 });
-  const centerRef = useRef({ x: 0, y: 0 });
+// 3. AI CAT COMPANION
+const AICat = ({ targetPos }) => {
+    const ref = useRef();
+    useFrame(() => {
+        if(ref.current) {
+            // Follow player with delay
+            ref.current.position.x = THREE.MathUtils.lerp(ref.current.position.x, targetPos[0] - 0.8, 0.05);
+            ref.current.position.z = THREE.MathUtils.lerp(ref.current.position.z, targetPos[2] - 0.8, 0.05);
+            ref.current.position.y = 0.5 + Math.sin(Date.now() * 0.005) * 0.2;
+            ref.current.lookAt(targetPos[0], targetPos[1], targetPos[2]);
+        }
+    });
+    return (
+        <group ref={ref} position={[0,0,0]}>
+             <mesh castShadow>
+                 <sphereGeometry args={[0.2]} />
+                 <meshStandardMaterial color="#00ffff" emissive="#00ffff" emissiveIntensity={1} />
+             </mesh>
+             {/* Ears */}
+             <mesh position={[0.1, 0.15, 0]}> <coneGeometry args={[0.08, 0.15]} /> <meshBasicMaterial color="#00ffff" /> </mesh>
+             <mesh position={[-0.1, 0.15, 0]}> <coneGeometry args={[0.08, 0.15]} /> <meshBasicMaterial color="#00ffff" /> </mesh>
+             <Trail width={0.4} length={4} color="#00ffff" attenuation={(t) => t * t} />
+        </group>
+    );
+};
 
-  const handleStart = (e) => {
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
-    setActive(true);
-    centerRef.current = { x: clientX, y: clientY };
-  };
-
-  const handleMove = (e) => {
-    if (!active) return;
-    const clientX = e.touches ? e.touches[0].clientX : e.clientX;
-    const clientY = e.touches ? e.touches[0].clientY : e.clientY;
+// 4. TRAFFIC SYSTEM
+const Car = ({ startPos, axis, speed, color }) => {
+    const ref = useRef();
+    const [offset, setOffset] = useState(Math.random() * 20);
     
-    const dx = clientX - centerRef.current.x;
-    const dy = clientY - centerRef.current.y;
-    const dist = Math.min(Math.sqrt(dx*dx + dy*dy), 50);
-    const angle = Math.atan2(dy, dx);
-    
-    const newX = Math.cos(angle) * dist;
-    const newY = Math.sin(angle) * dist;
-    
-    setPos({ x: newX, y: newY });
-    onMove({ x: newX / 50, y: newY / 50 });
-  };
+    useFrame((state) => {
+        if(ref.current) {
+            const time = state.clock.elapsedTime * speed + offset;
+            const limit = CITY_SIZE / 2 + 5;
+            
+            // Loop the car movement
+            let pos = (time % (limit * 2)) - limit;
+            
+            if (axis === 'x') {
+                ref.current.position.set(pos, 0.5, startPos[2]);
+                ref.current.rotation.y = speed > 0 ? Math.PI / 2 : -Math.PI / 2;
+            } else {
+                ref.current.position.set(startPos[0], 0.5, pos);
+                ref.current.rotation.y = speed > 0 ? 0 : Math.PI;
+            }
+        }
+    });
 
-  const handleEnd = () => {
-    setActive(false);
-    setPos({ x: 0, y: 0 });
-    onMove({ x: 0, y: 0 });
-  };
+    return (
+        <group ref={ref}>
+            <mesh castShadow>
+                <boxGeometry args={[1.5, 0.8, 3]} />
+                <meshStandardMaterial color={color} />
+            </mesh>
+            {/* Headlights */}
+            <mesh position={[0, 0, 1.5]}>
+                <boxGeometry args={[1.2, 0.2, 0.1]} />
+                <meshStandardMaterial color="yellow" emissive="yellow" emissiveIntensity={2} />
+            </mesh>
+        </group>
+    );
+};
 
-  return (
-    <div 
-        className="absolute bottom-8 left-8 w-32 h-32 bg-white/10 backdrop-blur-md rounded-full border border-white/20 touch-none flex items-center justify-center z-40"
-        onMouseDown={handleStart} onTouchStart={handleStart}
-        onMouseMove={handleMove} onTouchMove={handleMove}
-        onMouseUp={handleEnd} onTouchEnd={handleEnd}
-        onMouseLeave={handleEnd}
-    >
+// 5. PHYSICAL SHOP BUILDING
+const ShopBuilding = ({ position }) => {
+    return (
+        <group position={position}>
+            {/* Base */}
+            <mesh castShadow position={[0, 2, 0]}>
+                <boxGeometry args={[6, 4, 6]} />
+                <meshStandardMaterial color="#4c0519" />
+            </mesh>
+            {/* Roof */}
+            <mesh position={[0, 4.5, 0]}>
+                <coneGeometry args={[4.5, 2, 4]} />
+                <meshStandardMaterial color="#be123c" />
+            </mesh>
+            {/* Neon Sign */}
+            <Text position={[0, 3, 3.1]} fontSize={0.8} color="#facc15" anchorX="center" anchorY="middle">
+                FORTUNE
+            </Text>
+            {/* Entrance Zone */}
+            <mesh position={[0, 0.1, 4]} rotation={[-Math.PI/2, 0, 0]}>
+                <circleGeometry args={[2]} />
+                <meshBasicMaterial color="#facc15" transparent opacity={0.3} />
+            </mesh>
+            <Sparkles position={[0, 1, 4]} scale={[3, 2, 3]} color="yellow" count={20} />
+        </group>
+    );
+};
+
+// 6. MISSION ITEMS
+const MissionObjective = ({ pos, type }) => {
+    return (
+        <group position={pos}>
+            <Float speed={5} rotationIntensity={1} floatIntensity={1}>
+                {type === 'danger' ? (
+                    <mesh>
+                         <dodecahedronGeometry args={[0.5]} />
+                         <meshStandardMaterial color="red" emissive="red" emissiveIntensity={2} />
+                    </mesh>
+                ) : (
+                    <mesh>
+                        <boxGeometry args={[0.6, 0.6, 0.6]} />
+                        <meshStandardMaterial color="#00ff00" emissive="#00ff00" emissiveIntensity={1} />
+                    </mesh>
+                )}
+            </Float>
+            <Sparkles count={20} scale={2} color={type === 'danger' ? "red" : "green"} />
+            {/* Beacon */}
+            <mesh position={[0, 10, 0]}>
+                 <cylinderGeometry args={[0.05, 0.05, 20]} />
+                 <meshBasicMaterial color={type === 'danger' ? "red" : "green"} transparent opacity={0.2} />
+            </mesh>
+        </group>
+    );
+};
+
+
+// --- JOYSTICK COMPONENT (Improved) ---
+const Joystick = ({ onInput }) => {
+    const stickRef = useRef();
+    const baseRef = useRef();
+    const touchId = useRef(null);
+    const center = useRef({ x: 0, y: 0 });
+
+    const handleStart = (e) => {
+        const touch = e.changedTouches ? e.changedTouches[0] : e;
+        touchId.current = touch.identifier;
+        const rect = baseRef.current.getBoundingClientRect();
+        center.current = { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+        updateStick(touch.clientX, touch.clientY);
+    };
+
+    const handleMove = (e) => {
+        const touch = e.changedTouches ? Array.from(e.changedTouches).find(t => t.identifier === touchId.current) : e;
+        if (!touch) return;
+        updateStick(touch.clientX, touch.clientY);
+    };
+
+    const handleEnd = () => {
+        touchId.current = null;
+        if (stickRef.current) stickRef.current.style.transform = `translate(0px, 0px)`;
+        onInput({ x: 0, y: 0 });
+    };
+
+    const updateStick = (clientX, clientY) => {
+        const maxDist = 40;
+        const dx = clientX - center.current.x;
+        const dy = clientY - center.current.y;
+        const dist = Math.min(Math.sqrt(dx*dx + dy*dy), maxDist);
+        const angle = Math.atan2(dy, dx);
+        
+        const x = Math.cos(angle) * dist;
+        const y = Math.sin(angle) * dist;
+        
+        if (stickRef.current) {
+            stickRef.current.style.transform = `translate(${x}px, ${y}px)`;
+        }
+        
+        // Normalize output -1 to 1
+        onInput({ x: x / maxDist, y: y / maxDist });
+    };
+
+    return (
         <div 
-            className="w-12 h-12 bg-white/80 rounded-full shadow-[0_0_15px_rgba(255,255,255,0.5)]"
-            style={{ transform: `translate(${pos.x}px, ${pos.y}px)` }} 
-        />
-    </div>
-  );
-}
+            ref={baseRef}
+            className="absolute bottom-10 left-10 w-32 h-32 rounded-full bg-white/10 backdrop-blur border-2 border-white/20 touch-none pointer-events-auto flex items-center justify-center z-50"
+            onMouseDown={handleStart} onMouseMove={handleMove} onMouseUp={handleEnd} onMouseLeave={handleEnd}
+            onTouchStart={handleStart} onTouchMove={handleMove} onTouchEnd={handleEnd}
+        >
+            <div ref={stickRef} className="w-12 h-12 rounded-full bg-white/80 shadow-[0_0_15px_rgba(255,255,255,0.8)] pointer-events-none" />
+        </div>
+    );
+};
 
-// --- MAIN APP COMPONENT ---
+
+// --- MAIN APP LOGIC ---
 
 export default function App() {
-  // Movement State
-  const [pos, setPos] = useState([0, 0, 0]);
-  const [input, setInput] = useState({ x: 0, y: 0 });
-  
-  // Game Logic State
-  const [tokens, setTokens] = useState(10);
-  const [isCarrying, setIsCarrying] = useState(false);
-  const [outfitColor, setOutfitColor] = useState("#ec4899");
-  
-  // Mission State
-  const [missionState, setMissionState] = useState({ active: false, step: 0, type: null }); 
-  const [spawnParcel, setSpawnParcel] = useState(false);
-  const [interactionTarget, setInteractionTarget] = useState(null); // Which object is close?
-  
-  // UI State
-  const [dialogue, setDialogue] = useState(null);
-  const [showShop, setShowShop] = useState(false);
-  const [showPuzzle, setShowPuzzle] = useState(false);
-  const [puzzleInput, setPuzzleInput] = useState([]);
-
-  // --- GAME LOOP & PROXIMITY CHECK ---
-  const GameLogic = () => {
-    useFrame((state) => {
-      // 1. Movement
-      if (input.x !== 0 || input.y !== 0) {
-        setPos(p => [
-            p[0] + input.x * MOVEMENT_SPEED,
-            p[1],
-            p[2] + input.y * MOVEMENT_SPEED
-        ]);
-      }
-
-      // 2. Proximity Detection
-      let nearest = null;
-      let minDist = Infinity;
-      
-      NPC_DATA.forEach(npc => {
-          // Logic to determine if object exists in world
-          if (npc.id === 'parcel_spawn' && !spawnParcel) return; // Parcel not active
-          
-          const dist = Math.sqrt(
-              Math.pow(pos[0] - npc.position[0], 2) + 
-              Math.pow(pos[2] - npc.position[2], 2)
-          );
-
-          if (dist < INTERACTION_DIST && dist < minDist) {
-              minDist = dist;
-              nearest = npc;
-          }
-      });
-
-      // Update target if changed (prevents flicker)
-      if (nearest?.id !== interactionTarget?.id) {
-          setInteractionTarget(nearest);
-      }
-    });
-    return null;
-  };
-
-  // --- INTERACTION LOGIC ---
-  const handleInteract = () => {
-      if (!interactionTarget) return;
-      const target = interactionTarget;
-
-      // 1. ELDER TREE (Mission Giver)
-      if (target.id === 'elder') {
-          if (!missionState.active) {
-              setDialogue("Elder: Greetings! A Data Parcel was lost near the Merchant zone. Please retrieve it.");
-              setMissionState({ active: true, type: 'delivery' });
-              setSpawnParcel(true); // Spawn the item in the world
-          } else if (missionState.type === 'delivery' && isCarrying) {
-              setDialogue("Elder: Wonderful! You found the missing data. Here is your reward.");
-              setTokens(t => t + 50);
-              setMissionState({ active: false, type: null });
-              setIsCarrying(false);
-          } else if (missionState.type === 'delivery' && !isCarrying) {
-              setDialogue("Elder: Use your scanner arrow to find the parcel.");
-          } else {
-              setDialogue("Elder: The winds are calm today.");
-          }
-      }
-
-      // 2. PARCEL (Item)
-      if (target.id === 'parcel_spawn') {
-          setDialogue("System: Parcel Acquired. Deliver to Elder.");
-          setIsCarrying(true);
-          setSpawnParcel(false); // Remove from world
-      }
-
-      // 3. MONOLITH (Puzzle)
-      if (target.id === 'monolith') {
-          setShowPuzzle(true);
-      }
-
-      // 4. ROCK (Flavor)
-      if (target.id === 'rock') {
-          setDialogue("It's humming with a strange energy...");
-      }
-  };
-
-  // --- PUZZLE LOGIC ---
-  const handlePuzzleClick = (color) => {
-    const newSeq = [...puzzleInput, color];
-    setPuzzleInput(newSeq);
+    // Refs
+    const controlsRef = useRef({ x: 0, y: 0 });
     
-    if (newSeq.length === PUZZLE_SEQUENCE.length) {
-        const isCorrect = newSeq.every((val, index) => val === PUZZLE_SEQUENCE[index]);
-        if (isCorrect) {
-            setDialogue("Monolith: Access Granted. +100 Tokens.");
-            setTokens(t => t + 100);
-            setShowPuzzle(false);
-        } else {
-            setDialogue("Monolith: Sequence Failed.");
+    // State
+    const [playerPos, setPlayerPos] = useState([0, 0, 0]);
+    const [playerRot, setPlayerRot] = useState(0);
+    const [isMoving, setIsMoving] = useState(false);
+    const [tokens, setTokens] = useState(0);
+    const [activeMission, setActiveMission] = useState(null);
+    const [shopOpen, setShopOpen] = useState(false);
+    const [canEnterShop, setCanEnterShop] = useState(false);
+    const [gameMsg, setGameMsg] = useState("Welcome to Neon City. Find the Elder.");
+
+    // Procedural City Generation (Memoized)
+    const cityData = useMemo(() => {
+        const buildings = [];
+        const shopPos = [10, 0, 10]; // Fixed Shop location
+        
+        for (let i = 0; i < BUILDING_COUNT; i++) {
+            // Random position but avoid roads (x approx 0, z approx 0) and shop
+            let x = (Math.random() - 0.5) * CITY_SIZE;
+            let z = (Math.random() - 0.5) * CITY_SIZE;
+            
+            // Keep roads clear (Road width 8)
+            if (Math.abs(x) < 5 || Math.abs(z) < 5) continue;
+            // Keep shop area clear
+            if (Math.abs(x - shopPos[0]) < 6 && Math.abs(z - shopPos[2]) < 6) continue;
+
+            const height = 2 + Math.random() * 6;
+            buildings.push({
+                position: [x, height/2, z],
+                size: [2 + Math.random()*2, height, 2 + Math.random()*2],
+                color: Math.random() > 0.8 ? COLORS.neonPink : COLORS.buildingLight,
+                emissive: Math.random() > 0.9 ? COLORS.neonBlue : "black",
+                emissiveIntensity: 0.5
+            });
         }
-        setPuzzleInput([]);
-    }
-  };
+        return { buildings, shopPos };
+    }, []);
 
-  // --- SHOP LOGIC ---
-  const buyItem = (item) => {
-    if (tokens >= item.cost) {
-        setTokens(t => t - item.cost);
-        if (item.type === 'consumable') {
-            const f = FORTUNES[Math.floor(Math.random() * FORTUNES.length)];
-            setDialogue(`Fortune: "${f}"`);
+    // Game Loop
+    const GameLoop = () => {
+        useFrame((state) => {
+            const { x, y } = controlsRef.current;
+            
+            if (Math.abs(x) > 0.1 || Math.abs(y) > 0.1) {
+                setIsMoving(true);
+                
+                // Calculate Rotation (Face direction)
+                const targetRot = Math.atan2(x, y); // x is left/right, y is up/down on screen
+                setPlayerRot(targetRot);
+                
+                // Calculate Forward Movement relative to Camera (Camera is fixed offset)
+                // In standard 3D mapping: Y-stick is Z-world, X-stick is X-world
+                const moveX = x * PLAYER_SPEED;
+                const moveZ = y * PLAYER_SPEED;
+
+                // Proposed new position
+                const newPos = [
+                    playerPos[0] + moveX,
+                    playerPos[1],
+                    playerPos[2] + moveZ
+                ];
+
+                // Collision Check
+                if (!checkCollision(newPos, cityData.buildings)) {
+                    setPlayerPos(newPos);
+                }
+
+                // Camera Follow (Smooth Lerp)
+                state.camera.position.x = THREE.MathUtils.lerp(state.camera.position.x, playerPos[0], 0.1);
+                state.camera.position.z = THREE.MathUtils.lerp(state.camera.position.z, playerPos[2] + 10, 0.1); // +10 offset Z
+                state.camera.lookAt(playerPos[0], 0, playerPos[2]); // Look at player
+            } else {
+                setIsMoving(false);
+                // Idle Camera
+                state.camera.position.x = THREE.MathUtils.lerp(state.camera.position.x, playerPos[0], 0.05);
+                state.camera.position.z = THREE.MathUtils.lerp(state.camera.position.z, playerPos[2] + 12, 0.05);
+                state.camera.lookAt(playerPos[0], 0, playerPos[2]);
+            }
+
+            // Logic Checks
+            // 1. Shop Entry
+            const distToShop = Math.sqrt(Math.pow(playerPos[0] - cityData.shopPos[0], 2) + Math.pow(playerPos[2] - cityData.shopPos[2], 2));
+            if (distToShop < 4) {
+                if(!canEnterShop) setCanEnterShop(true);
+            } else {
+                if(canEnterShop) setCanEnterShop(false);
+            }
+
+            // 2. Mission Objectives
+            if (activeMission) {
+                const distToTarget = Math.sqrt(Math.pow(playerPos[0] - activeMission.targetPos[0], 2) + Math.pow(playerPos[2] - activeMission.targetPos[2], 2));
+                if (distToTarget < 1.5) {
+                    // Complete Mission
+                    setTokens(t => t + activeMission.reward);
+                    setGameMsg(`Mission Complete! +${activeMission.reward} Tokens`);
+                    setActiveMission(null);
+                }
+            }
+        });
+        return null;
+    };
+
+    // --- UI HANDLERS ---
+    const handleJoystick = (data) => {
+        controlsRef.current = data;
+    };
+
+    const startMission = (id) => {
+        const m = MISSIONS.find(m => m.id === id);
+        setActiveMission(m);
+        setGameMsg(m.desc);
+        setShopOpen(false); // Close shop if open
+    };
+
+    const buyCookie = () => {
+        if (tokens >= 20) {
+            setTokens(t => t - 20);
+            const fortunes = ["Luck is on the road.", "Look behind the blue building.", "Avoid the red cars.", "A great surprise awaits."];
+            setGameMsg(`Fortune: ${fortunes[Math.floor(Math.random()*fortunes.length)]}`);
         } else {
-            setOutfitColor(item.color);
-            setDialogue(`Equipped ${item.name}!`);
+            setGameMsg("Not enough tokens (Need 20).");
         }
-    } else {
-        setDialogue("Not enough tokens!");
-    }
-  };
+    };
 
-  // Helper for arrow target
-  const getObjectivePos = () => {
-      if (!missionState.active) return null;
-      if (missionState.type === 'delivery' && !isCarrying) return NPC_DATA.find(n => n.id === 'parcel_spawn').position;
-      if (missionState.type === 'delivery' && isCarrying) return NPC_DATA.find(n => n.id === 'elder').position;
-      return null;
-  };
-
-  return (
-    <div className="w-full h-full bg-black text-white font-sans select-none overflow-hidden relative">
-      
-      {/* 3D SCENE */}
-      <Canvas shadows>
-        <PerspectiveCamera makeDefault position={[10, 10, 10]} fov={50} />
-        <OrbitControls target={pos} maxDistance={20} minDistance={5} enablePan={false} />
-        
-        <ambientLight intensity={0.5} />
-        <directionalLight position={[10, 20, 5]} intensity={1.5} castShadow />
-        <Stars radius={100} depth={50} count={5000} factor={4} fade />
-        
-        <Terrain />
-        
-        {/* Render World Objects */}
-        {NPC_DATA.map(npc => (
-            <WorldObject key={npc.id} data={npc} isVisible={!(npc.id === 'parcel_spawn' && !spawnParcel)} />
-        ))}
-
-        <Player position={pos} color={outfitColor} isCarrying={isCarrying} />
-        <AICat targetPos={pos} />
-        
-        {/* Navigation Arrow */}
-        {missionState.active && <WaypointArrow playerPos={pos} targetPos={getObjectivePos()} />}
-        
-        <GameLogic />
-      </Canvas>
-
-      {/* --- UI HUD --- */}
-      
-      <div className="absolute top-4 left-4 bg-black/50 backdrop-blur border border-white/20 p-2 px-4 rounded-full flex items-center gap-2">
-        <div className="w-4 h-4 rounded-full bg-yellow-400" />
-        <span className="font-bold text-xl">{tokens}</span>
-      </div>
-
-      {missionState.active && (
-          <div className="absolute top-16 left-4 bg-blue-900/80 backdrop-blur border border-blue-400 p-3 rounded-lg max-w-[200px]">
-              <p className="text-xs text-blue-200 uppercase font-bold">Current Objective</p>
-              <p className="text-sm font-medium">{isCarrying ? "Return to Elder" : "Find the Parcel"}</p>
-          </div>
-      )}
-
-      {/* --- ACTION BUTTONS --- */}
-      
-      <div className="absolute top-4 right-4 flex gap-3">
-        <button 
-            onClick={() => setShowShop(!showShop)}
-            className="p-3 bg-white/10 rounded-full border border-white/20 hover:bg-white/20 active:scale-95 transition-all"
-        >
-            <ShoppingBag size={24} />
-        </button>
-      </div>
-
-      {/* INTERACTION BUTTON (Context Sensitive) */}
-      {interactionTarget && !dialogue && !showPuzzle && !showShop && (
-        <div className="absolute bottom-32 right-8 animate-in slide-in-from-bottom-4 fade-in z-50">
-            <button 
-                onClick={handleInteract}
-                className="w-24 h-24 bg-pink-600 rounded-full border-4 border-white/30 shadow-[0_0_30px_rgba(236,72,153,0.6)] flex flex-col items-center justify-center active:scale-95 transition-transform"
-            >
-                {interactionTarget.type === 'item' ? <Package size={32} /> : <MessageCircle size={32} />}
-                <span className="text-[10px] font-bold uppercase mt-1">
-                    {interactionTarget.type === 'item' ? 'Grab' : 'Interact'}
-                </span>
-            </button>
-        </div>
-      )}
-
-      {/* --- MODALS --- */}
-
-      {/* Dialogue */}
-      {dialogue && (
-          <div className="absolute top-1/2 left-1/2 -translate-x-1/2 -translate-y-1/2 bg-gray-900/90 border border-gray-500 p-6 rounded-2xl w-[90%] max-w-sm text-center z-50 shadow-2xl">
-              <MessageCircle className="mx-auto mb-2 text-pink-500" />
-              <p className="text-lg mb-4">{dialogue}</p>
-              <button onClick={() => setDialogue(null)} className="bg-white text-black px-6 py-2 rounded-full font-bold">Close</button>
-          </div>
-      )}
-
-      {/* Shop */}
-      {showShop && (
-          <div className="absolute inset-0 bg-black/80 z-50 flex items-center justify-center p-4">
-              <div className="bg-gray-800 border border-gray-600 w-full max-w-md rounded-2xl p-6">
-                  <div className="flex justify-between items-center mb-6">
-                      <h2 className="text-2xl font-bold">Token Exchange</h2>
-                      <button onClick={() => setShowShop(false)} className="text-gray-400">✕</button>
-                  </div>
-                  <div className="space-y-3">
-                      {SHOP_ITEMS.map(item => (
-                          <div key={item.id} className="flex justify-between items-center bg-gray-700/50 p-3 rounded-xl">
-                              <div className="flex items-center gap-3">
-                                  <div className="w-8 h-8 rounded-full" style={{ background: item.color || '#fff' }} />
-                                  <div>
-                                      <p className="font-bold">{item.name}</p>
-                                      <p className="text-xs text-yellow-400">{item.cost} Tokens</p>
-                                  </div>
-                              </div>
-                              <button onClick={() => buyItem(item)} className="bg-blue-600 px-3 py-1 rounded-lg text-sm font-bold active:bg-blue-700">Buy</button>
-                          </div>
-                      ))}
-                  </div>
-              </div>
-          </div>
-      )}
-
-      {/* Puzzle Overlay */}
-      {showPuzzle && (
-        <div className="absolute inset-0 bg-black/90 flex items-center justify-center z-50">
-            <div className="bg-gray-900 p-8 rounded-2xl border border-blue-500 text-center w-[90%] max-w-sm">
-                <h2 className="text-2xl font-bold mb-2 text-blue-400">Security Access</h2>
-                <p className="text-xs text-gray-400 mb-6">Input Sequence: <span className="text-white">Red, Green, Blue, Red</span></p>
+    return (
+        <div className="w-full h-full bg-black relative select-none font-mono text-white overflow-hidden">
+            
+            {/* 3D RENDERER */}
+            <Canvas shadows dpr={[1, 2]}>
+                {/* Camera is controlled by GameLoop now, but we set initial */}
+                <PerspectiveCamera makeDefault position={[0, 10, 12]} fov={50} />
                 
-                <div className="flex gap-4 mb-6 justify-center">
-                    {['red', 'green', 'blue'].map(c => (
-                        <button 
-                            key={c}
-                            onClick={() => handlePuzzleClick(c)}
-                            className="w-16 h-16 rounded-lg border-2 border-white/20 active:scale-90 transition-transform shadow-[0_0_15px_rgba(255,255,255,0.2)]"
-                            style={{ backgroundColor: c }}
-                        />
-                    ))}
-                </div>
+                {/* Environment */}
+                <color attach="background" args={['#050510']} />
+                <fog attach="fog" args={['#050510', 10, 40]} />
+                <ambientLight intensity={0.4} />
+                <directionalLight position={[10, 20, 10]} intensity={1} castShadow shadow-mapSize={[1024, 1024]} />
+                <Stars radius={100} depth={50} count={5000} factor={4} fade />
                 
-                <div className="flex gap-2 justify-center h-4">
-                    {puzzleInput.map((c, i) => (
-                        <div key={i} className="w-3 h-3 rounded-full border border-white" style={{ background: c }} />
-                    ))}
-                </div>
+                {/* World */}
+                <City buildings={cityData.buildings} />
+                <ShopBuilding position={cityData.shopPos} />
+                
+                {/* Dynamic Elements */}
+                <Car startPos={[0, 0, -20]} axis="z" speed={5} color="red" />
+                <Car startPos={[0, 0, 20]} axis="z" speed={-4} color="blue" />
+                <Car startPos={[-20, 0, 0]} axis="x" speed={6} color="orange" />
 
-                <button onClick={() => setShowPuzzle(false)} className="mt-8 text-gray-400 text-sm hover:text-white underline">Cancel</button>
+                {/* Player & AI */}
+                <Player position={playerPos} rotation={playerRot} isMoving={isMoving} />
+                <AICat targetPos={playerPos} />
+                
+                {/* Mission Markers */}
+                {activeMission && <MissionObjective pos={activeMission.targetPos} type={activeMission.type} />}
+
+                <GameLoop />
+            </Canvas>
+
+
+            {/* --- HUD UI --- */}
+            
+            {/* Top Bar */}
+            <div className="absolute top-0 left-0 w-full p-4 flex justify-between items-start pointer-events-none">
+                <div className="flex flex-col gap-2">
+                    <div className="bg-black/60 backdrop-blur border border-pink-500/50 p-2 rounded-lg flex items-center gap-2 pointer-events-auto">
+                        <div className="w-3 h-3 rounded-full bg-yellow-400 animate-pulse" />
+                        <span className="font-bold text-xl tracking-wider text-yellow-400">{tokens} CREDITS</span>
+                    </div>
+                    {activeMission && (
+                        <div className="bg-blue-900/80 border border-blue-400 p-3 rounded-lg max-w-[250px] animate-in slide-in-from-left">
+                            <h3 className="text-blue-300 text-xs font-bold uppercase mb-1">CURRENT MISSION</h3>
+                            <p className="text-sm font-bold text-white">{activeMission.title}</p>
+                            <p className="text-xs text-blue-200 mt-1">{activeMission.desc}</p>
+                        </div>
+                    )}
+                </div>
             </div>
+
+            {/* Message Feed */}
+            <div className="absolute top-20 left-1/2 -translate-x-1/2 w-full max-w-md text-center pointer-events-none">
+                <p className="text-pink-400 font-bold text-shadow-sm bg-black/40 inline-block px-4 py-1 rounded-full backdrop-blur-sm border border-white/10">
+                    {gameMsg}
+                </p>
+            </div>
+
+            {/* Controls */}
+            <Joystick onInput={handleJoystick} />
+
+            {/* Action Buttons */}
+            {canEnterShop && !shopOpen && (
+                <div className="absolute bottom-32 right-8 z-50">
+                    <button 
+                        onClick={() => setShopOpen(true)}
+                        className="bg-yellow-500 text-black font-bold p-6 rounded-full shadow-[0_0_20px_rgba(234,179,8,0.6)] animate-bounce border-4 border-white"
+                    >
+                        ENTER SHOP
+                    </button>
+                </div>
+            )}
+
+            {/* SHOP INTERFACE */}
+            {shopOpen && (
+                <div className="absolute inset-0 bg-black/90 z-50 flex items-center justify-center p-4">
+                    <div className="w-full max-w-lg bg-gray-900 border-2 border-pink-600 rounded-3xl overflow-hidden shadow-2xl relative">
+                        <div className="bg-pink-700 p-4">
+                            <h2 className="text-2xl font-black italic tracking-widest text-center">FORTUNE PAGODA</h2>
+                        </div>
+                        
+                        <div className="p-6 space-y-6">
+                            {/* Shop Item */}
+                            <div className="flex items-center justify-between bg-white/5 p-4 rounded-xl border border-white/10">
+                                <div className="flex items-center gap-4">
+                                    <div className="bg-yellow-500/20 p-3 rounded-lg">
+                                        <Zap className="text-yellow-400" />
+                                    </div>
+                                    <div>
+                                        <p className="font-bold text-lg">Fortune Cookie</p>
+                                        <p className="text-gray-400 text-sm">Reveals secrets of the city</p>
+                                    </div>
+                                </div>
+                                <button onClick={buyCookie} className="px-4 py-2 bg-yellow-500 hover:bg-yellow-400 text-black font-bold rounded-lg transition-colors">
+                                    20 CR
+                                </button>
+                            </div>
+
+                            <div className="h-px bg-white/10 my-4" />
+
+                            <h3 className="text-pink-400 font-bold uppercase text-sm">Available Missions</h3>
+                            <div className="grid grid-cols-1 gap-3 max-h-[200px] overflow-y-auto">
+                                {MISSIONS.map(m => (
+                                    <button 
+                                        key={m.id}
+                                        onClick={() => startMission(m.id)}
+                                        className="text-left bg-gray-800 hover:bg-gray-700 p-3 rounded-lg border border-gray-600 hover:border-pink-500 transition-all group"
+                                    >
+                                        <div className="flex justify-between items-center mb-1">
+                                            <span className="font-bold group-hover:text-pink-300">{m.title}</span>
+                                            <span className="text-xs bg-black/50 px-2 py-1 rounded text-green-400">{m.reward} CR</span>
+                                        </div>
+                                        <p className="text-xs text-gray-400 line-clamp-1">{m.desc}</p>
+                                    </button>
+                                ))}
+                            </div>
+                        </div>
+
+                        <div className="p-4 bg-black/20 text-center">
+                            <button onClick={() => setShopOpen(false)} className="text-gray-400 hover:text-white underline text-sm">
+                                Leave Shop
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            )}
         </div>
-      )}
-
-      {/* --- CONTROLS --- */}
-      <Joystick onMove={setInput} />
-
-    </div>
-  );
+    );
 }
 
 
