@@ -1,4 +1,4 @@
-import React, { useState, useRef, useMemo } from "react";
+import React, { useState, useRef, useMemo, useEffect } from "react";
 import { Canvas, useFrame } from "@react-three/fiber";
 import { Text, Stars, PerspectiveCamera } from "@react-three/drei";
 import * as THREE from "three";
@@ -8,8 +8,8 @@ const PLAYER_SPEED = 0.22;
 const TALK_RADIUS = 2.2;
 
 const CHUNK_SIZE = 20;
-const VIEW_RADIUS = 2; // how many chunks around player
-const WORLD_LIMIT = 8; // soft boundary in chunks
+const VIEW_RADIUS = 2;
+const WORLD_LIMIT = 8;
 
 // ================= DIALOGUE =================
 const DIALOGUE = {
@@ -70,9 +70,9 @@ const GroundTile = ({ x, z, type }) => {
   );
 };
 
-const Building = ({ x, z, h }) => (
+const Building = ({ x, z, w, d, h }) => (
   <mesh position={[x, h / 2, z]} castShadow receiveShadow>
-    <boxGeometry args={[2 + Math.random(), h, 2 + Math.random()]} />
+    <boxGeometry args={[w, h, d]} />
     <meshStandardMaterial color="#1e293b" />
   </mesh>
 );
@@ -132,6 +132,8 @@ function generateChunk(cx, cz) {
       buildings.push({
         x: (rand() - 0.5) * CHUNK_SIZE + cx * CHUNK_SIZE,
         z: (rand() - 0.5) * CHUNK_SIZE + cz * CHUNK_SIZE,
+        w: 2 + rand() * 1.5,
+        d: 2 + rand() * 1.5,
         h: 3 + rand() * 6
       });
     }
@@ -150,6 +152,7 @@ function generateChunk(cx, cz) {
 
   return { cx, cz, biome, buildings, npcs };
 }
+
 // ================= PLAYER =================
 const Player = ({ position, rotation, moving }) => {
   const body = useRef();
@@ -226,6 +229,20 @@ export default function App() {
   const chunksRef = useRef(new Map());
   const [, force] = useState(0);
 
+  // Sounds
+  const ambientRef = useRef(null);
+  const stepRef = useRef(null);
+
+  useEffect(() => {
+    ambientRef.current = new Audio("/sounds/ambient-city.mp3");
+    ambientRef.current.loop = true;
+    ambientRef.current.volume = 0.4;
+    ambientRef.current.play().catch(() => {});
+
+    stepRef.current = new Audio("/sounds/step.mp3");
+    stepRef.current.volume = 0.2;
+  }, []);
+
   const getChunk = (cx, cz) => {
     const k = hash(cx, cz);
     if (!chunksRef.current.has(k)) {
@@ -262,12 +279,35 @@ export default function App() {
         let nx = pos[0] + input.x * PLAYER_SPEED;
         let nz = pos[2] + input.y * PLAYER_SPEED;
 
-        // Soft world boundary
         const limit = WORLD_LIMIT * CHUNK_SIZE;
         nx = THREE.MathUtils.clamp(nx, -limit, limit);
         nz = THREE.MathUtils.clamp(nz, -limit, limit);
 
-        setPos([nx, 0, nz]);
+        // Collision
+        let blocked = false;
+        for (const c of chunksRef.current.values()) {
+          for (const b of c.buildings) {
+            const pad = 0.6;
+            if (
+              nx > b.x - b.w / 2 - pad &&
+              nx < b.x + b.w / 2 + pad &&
+              nz > b.z - b.d / 2 - pad &&
+              nz < b.z + b.d / 2 + pad
+            ) {
+              blocked = true;
+              break;
+            }
+          }
+          if (blocked) break;
+        }
+
+        if (!blocked) {
+          setPos([nx, 0, nz]);
+          if (stepRef.current?.paused) {
+            stepRef.current.currentTime = 0;
+            stepRef.current.play().catch(() => {});
+          }
+        }
 
         state.camera.position.x = nx;
         state.camera.position.z = nz + 16;
@@ -297,7 +337,7 @@ export default function App() {
               type={c.biome}
             />
             {c.buildings.map((b, i) => (
-              <Building key={i} x={b.x} z={b.z} h={b.h} />
+              <Building key={i} x={b.x} z={b.z} w={b.w} d={b.d} h={b.h} />
             ))}
             {c.npcs.map((n, i) => (
               <NPC key={i} pos={n.pos} type={n.type} playerPos={pos} />
@@ -312,4 +352,4 @@ export default function App() {
       <Joystick onInput={setInput} />
     </div>
   );
-}
+      }
