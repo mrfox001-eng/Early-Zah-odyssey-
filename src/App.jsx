@@ -359,20 +359,31 @@ export const RoadTile = ({ x, z, dir, type }) => {
 };
 
 // Vehicle entity (grid-following, no building collision)
-export const Vehicle = ({ data }) => {
-  const ref = useRef();
-
-  useFrame(() => {
+useFrame(() => {
     if (!ref.current) return;
 
-    if (data.axis === "x") {
-      data.x += data.speed;
-      if (data.x > WORLD_LIMIT * CHUNK_SIZE)
-        data.x = -WORLD_LIMIT * CHUNK_SIZE;
-    } else {
+    // Move forward
+    if (data.dir === "vertical") {
       data.z += data.speed;
-      if (data.z > WORLD_LIMIT * CHUNK_SIZE)
-        data.z = -WORLD_LIMIT * CHUNK_SIZE;
+    } else {
+      data.x += data.speed;
+    }
+
+    const limit = WORLD_LIMIT * CHUNK_SIZE;
+    if (data.x > limit) data.x = -limit;
+    if (data.z > limit) data.z = -limit;
+
+    // Snap back to the nearest road spine
+    const r = getRoadAt(data.x, data.z);
+    if (r.isRoad) {
+      data.dir = r.dir;
+      if (r.dir === "vertical") {
+        const gx = Math.round(data.x / STREET_SPACING) * STREET_SPACING;
+        data.x = gx;
+      } else {
+        const gz = Math.round(data.z / STREET_SPACING) * STREET_SPACING;
+        data.z = gz;
+      }
     }
 
     ref.current.position.x = data.x;
@@ -387,7 +398,7 @@ export const Vehicle = ({ data }) => {
       ref.current.position.y = 0.15;
     }
 
-    ref.current.rotation.y = data.dir;
+    ref.current.rotation.y = data.dir === "vertical" ? Math.PI / 2 : 0;
   });
 
   const color =
