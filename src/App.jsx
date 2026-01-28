@@ -8,6 +8,10 @@ export const PLAYER_SPEED = 0.12;
 export const RUN_MULTIPLIER = 2.0;
 export const TALK_RADIUS = 2.2;
 
+export const DRIVE_SPEED = 0.18;
+export const DRIVE_TURN = 0.045;
+export const ENTER_RADIUS = 2.4;
+
 export const CHUNK_SIZE = 20;
 export const VIEW_RADIUS = 2;
 export const WORLD_LIMIT = 8;
@@ -54,6 +58,25 @@ export function seededRand(seed) {
     s = Math.sin(s) * 10000;
     return s - Math.floor(s);
   };
+}
+
+// ================= PLAYER MODE =================
+export function usePlayerMode() {
+  const [mode, setMode] = useState("walk"); // "walk" | "drive"
+  const [activeVehicle, setActiveVehicle] = useState(null);
+
+  const enterVehicle = (v) => {
+    setActiveVehicle(v);
+    setMode("drive");
+  };
+
+  const exitVehicle = () => {
+    if (activeVehicle) activeVehicle.__driver = null;
+    setActiveVehicle(null);
+    setMode("walk");
+  };
+
+  return { mode, activeVehicle, enterVehicle, exitVehicle };
 }
 
 // ================= GLOBAL ROAD GRID =================
@@ -107,7 +130,6 @@ export const Building = ({ x, z, w, d, h }) => (
     <meshStandardMaterial color="#1e293b" />
   </mesh>
 );
-
 // ================= NPC =================
 export const NPC = ({ pos, type, playerPos }) => {
   const ref = useRef();
@@ -145,6 +167,7 @@ export const NPC = ({ pos, type, playerPos }) => {
     </group>
   );
 };
+
 // ================= CHUNK GENERATOR (ROAD-AWARE) =================
 export function generateChunk(cx, cz) {
   const rand = seededRand(cx * 10007 + cz * 30011);
@@ -154,7 +177,6 @@ export function generateChunk(cx, cz) {
   const roads = [];
   const vehicles = [];
 
-  // Sample grid inside chunk to extract road segments
   const half = CHUNK_SIZE / 2;
   const step = 4;
 
@@ -165,7 +187,6 @@ export function generateChunk(cx, cz) {
       const r = getRoadAt(wx, wz);
 
       if (r.isRoad) {
-        // Build small segments; renderer will merge visually
         roads.push({
           x: wx,
           z: wz,
@@ -176,7 +197,6 @@ export function generateChunk(cx, cz) {
     }
   }
 
-  // Place buildings only in non-road zones
   const bCount = 10 + Math.floor(rand() * 8);
   let attempts = 0;
   while (buildings.length < bCount && attempts < 200) {
@@ -195,14 +215,12 @@ export function generateChunk(cx, cz) {
     });
   }
 
-  // NPCs spawn near sidewalks (edge of roads)
   const nCount = 1 + Math.floor(rand() * 3);
   for (let i = 0; i < nCount; i++) {
     let px = (rand() - 0.5) * CHUNK_SIZE + cx * CHUNK_SIZE;
     let pz = (rand() - 0.5) * CHUNK_SIZE + cz * CHUNK_SIZE;
     const r = getRoadAt(px, pz);
     if (r.isRoad) {
-      // push them slightly off the road
       px += r.dir === "vertical" ? 3 : 0;
       pz += r.dir === "horizontal" ? 3 : 0;
     }
@@ -212,7 +230,6 @@ export function generateChunk(cx, cz) {
     });
   }
 
-  // Vehicles spawn only on main roads
   const vCount = Math.floor(rand() * 2);
   for (let i = 0; i < vCount; i++) {
     const t = rand();
@@ -237,15 +254,14 @@ export function generateChunk(cx, cz) {
     vehicles.push({
       x,
       z,
-      dir: r.dir === "vertical" ? Math.PI / 2 : 0,
+      dir: r.dir,
       speed: 0.03 + rand() * 0.02,
-      type: rand() > 0.6 ? "hover" : rand() > 0.3 ? "wheel" : "surreal",
-      axis
+      type: rand() > 0.6 ? "hover" : rand() > 0.3 ? "wheel" : "surreal"
     });
   }
 
   return { cx, cz, buildings, npcs, roads, vehicles };
-}
+        }
 // ================= PLAYER =================
 export const Player = ({ position, rotation, moving, running }) => {
   const body = useRef();
@@ -339,9 +355,33 @@ export const RunButton = ({ setRunning }) => (
     RUN
   </div>
 );
-// ================= ROAD + TRAFFIC RENDERING =================
+// ================= CAMERA FOLLOW SYSTEM =================
+export function useDriveCamera(cameraRef) {
+  const followPlayer = (pos) => {
+    if (!cameraRef.current) return;
+    cameraRef.current.position.x = pos[0];
+    cameraRef.current.position.z = pos[2] + 16;
+    cameraRef.current.position.y = 12;
+    cameraRef.current.lookAt(pos[0], 0, pos[2]);
+  };
 
-// Road tile mesh (instanced-looking small segments)
+  const followVehicle = (veh) => {
+    if (!cameraRef.current || !veh) return;
+
+    const back =
+      veh.dir === "vertical"
+        ? new THREE.Vector3(0, 6, -12)
+        : new THREE.Vector3(-12, 6, 0);
+
+    const p = new THREE.Vector3(veh.x, 0, veh.z).add(back);
+    cameraRef.current.position.lerp(p, 0.18);
+    cameraRef.current.lookAt(veh.x, 0, veh.z);
+  };
+
+  return { followPlayer, followVehicle };
+}
+
+// ================= ROAD TILE =================
 export const RoadTile = ({ x, z, dir, type }) => {
   const w = type === "main" ? 3.2 : 2.0;
   const l = 4;
@@ -358,36 +398,45 @@ export const RoadTile = ({ x, z, dir, type }) => {
   );
 };
 
-// Vehicle entity (grid-following, no building collision)
-useFrame(() => {
+// ================= VEHICLE (ENTERABLE + AI) =================
+export const Vehicle = ({ data, playerPos, mode, enterVehicle }) => {
+  const ref = useRef();
+  const [near, setNear] = useState(false);
+
+  useFrame(() => {
     if (!ref.current) return;
 
-    // Move forward
-    if (data.dir === "vertical") {
-      data.z += data.speed;
-    } else {
-      data.x += data.speed;
-    }
+    // AI movement when not driven by player
+    if (!(mode === "drive" && data.__driver === "player")) {
+      if (data.dir === "vertical") data.z += data.speed;
+      else data.x += data.speed;
 
-    const limit = WORLD_LIMIT * CHUNK_SIZE;
-    if (data.x > limit) data.x = -limit;
-    if (data.z > limit) data.z = -limit;
+      const limit = WORLD_LIMIT * CHUNK_SIZE;
+      if (data.x > limit) data.x = -limit;
+      if (data.z > limit) data.z = -limit;
 
-    // Snap back to the nearest road spine
-    const r = getRoadAt(data.x, data.z);
-    if (r.isRoad) {
-      data.dir = r.dir;
-      if (r.dir === "vertical") {
-        const gx = Math.round(data.x / STREET_SPACING) * STREET_SPACING;
-        data.x = gx;
-      } else {
-        const gz = Math.round(data.z / STREET_SPACING) * STREET_SPACING;
-        data.z = gz;
+      const r = getRoadAt(data.x, data.z);
+      if (r.isRoad) {
+        data.dir = r.dir;
+        if (r.dir === "vertical") {
+          const gx = Math.round(data.x / STREET_SPACING) * STREET_SPACING;
+          data.x = gx;
+        } else {
+          const gz = Math.round(data.z / STREET_SPACING) * STREET_SPACING;
+          data.z = gz;
+        }
       }
     }
 
-    ref.current.position.x = data.x;
-    ref.current.position.z = data.z;
+    ref.current.position.set(data.x, 0, data.z);
+    ref.current.rotation.y =
+      data.dir === "vertical" ? Math.PI / 2 : 0;
+
+    if (playerPos) {
+      const p = new THREE.Vector3(...playerPos);
+      const d = p.distanceTo(ref.current.position);
+      setNear(d < ENTER_RADIUS);
+    }
 
     if (data.type === "hover") {
       ref.current.position.y = 0.45 + Math.sin(data.x * 0.2) * 0.1;
@@ -397,8 +446,6 @@ useFrame(() => {
     } else {
       ref.current.position.y = 0.15;
     }
-
-    ref.current.rotation.y = data.dir === "vertical" ? Math.PI / 2 : 0;
   });
 
   const color =
@@ -425,9 +472,28 @@ useFrame(() => {
         distance={5}
         color="#ffffff"
       />
-    </group>
-    } );
 
+      {near && (
+        <Text position={[0, 1.6, 0]} fontSize={0.28} color="#ffffff">
+          Tap to Drive
+        </Text>
+      )}
+
+      {near && (
+        <mesh
+          position={[0, 0.8, 0]}
+          onClick={() => {
+            data.__driver = "player";
+            enterVehicle(data);
+          }}
+        >
+          <sphereGeometry args={[0.6, 8, 8]} />
+          <meshBasicMaterial transparent opacity={0} />
+        </mesh>
+      )}
+    </group>
+  );
+};
 // ================= APP =================
 export default function App() {
   const [pos, setPos] = useState([0, 0, 0]);
@@ -435,31 +501,12 @@ export default function App() {
   const [input, setInput] = useState({ x: 0, y: 0 });
   const [running, setRunning] = useState(false);
 
+  const cameraRef = useRef();
+  const { mode, activeVehicle, enterVehicle, exitVehicle } = usePlayerMode();
+  const { followPlayer, followVehicle } = useDriveCamera(cameraRef);
+
   const chunksRef = useRef(new Map());
   const [, force] = useState(0);
-
-  const ambientRef = useRef(null);
-  const stepRef = useRef(null);
-
-  useEffect(() => {
-    ambientRef.current = new Audio("/sounds/ambient-city.mp3");
-    ambientRef.current.loop = true;
-    ambientRef.current.volume = 0.4;
-    ambientRef.current.play().catch(() => {});
-
-    stepRef.current = new Audio("/sounds/step.mp3");
-    stepRef.current.volume = 0.25;
-
-    const onKey = (e) => {
-      if (e.key === "Shift") setRunning(e.type === "keydown");
-    };
-    window.addEventListener("keydown", onKey);
-    window.addEventListener("keyup", onKey);
-    return () => {
-      window.removeEventListener("keydown", onKey);
-      window.removeEventListener("keyup", onKey);
-    };
-  }, []);
 
   const getChunk = (cx, cz) => {
     const k = hash(cx, cz);
@@ -485,55 +532,35 @@ export default function App() {
     for (const k of chunksRef.current.keys()) {
       if (!keep.has(k)) chunksRef.current.delete(k);
     }
-    force(v => v + 1);
+    force((v) => v + 1);
   };
 
   const GameLoop = () => {
-    useFrame((state) => {
-      if (input.x || input.y) {
+    useFrame(() => {
+      if (mode === "walk" && (input.x || input.y)) {
         const a = Math.atan2(input.x, input.y);
         setRot(a);
 
         const speed = running ? PLAYER_SPEED * RUN_MULTIPLIER : PLAYER_SPEED;
-
-        let nx = pos[0] + input.x * speed;
-        let nz = pos[2] + input.y * speed;
-
-        const limit = WORLD_LIMIT * CHUNK_SIZE;
-        nx = THREE.MathUtils.clamp(nx, -limit, limit);
-        nz = THREE.MathUtils.clamp(nz, -limit, limit);
-
-        let blocked = false;
-        for (const c of chunksRef.current.values()) {
-          for (const b of c.buildings) {
-            const pad = 0.6;
-            if (
-              nx > b.x - b.w / 2 - pad &&
-              nx < b.x + b.w / 2 + pad &&
-              nz > b.z - b.d / 2 - pad &&
-              nz < b.z + b.d / 2 + pad
-            ) {
-              blocked = true;
-              break;
-            }
-          }
-          if (blocked) break;
-        }
-
-        if (!blocked) {
-          setPos([nx, 0, nz]);
-          if (stepRef.current?.paused) {
-            stepRef.current.playbackRate = running ? 1.8 : 1.0;
-            stepRef.current.currentTime = 0;
-            stepRef.current.play().catch(() => {});
-          }
-        }
-
-        state.camera.position.x = nx;
-        state.camera.position.z = nz + 16;
-        state.camera.lookAt(nx, 0, nz);
-
+        const nx = pos[0] + input.x * speed;
+        const nz = pos[2] + input.y * speed;
+        setPos([nx, 0, nz]);
         updateChunks();
+      }
+
+      if (mode === "walk") {
+        followPlayer(pos);
+      } else if (mode === "drive" && activeVehicle) {
+        followVehicle(activeVehicle);
+
+        // Driving controls
+        if (input.y !== 0) {
+          activeVehicle.speed =
+            DRIVE_SPEED * (input.y > 0 ? 1 : -1);
+        }
+        if (input.x !== 0) {
+          activeVehicle.dir += input.x * DRIVE_TURN;
+        }
       }
     });
     return null;
@@ -544,7 +571,7 @@ export default function App() {
   return (
     <div style={{ position: "fixed", inset: 0 }}>
       <Canvas shadows fog={{ color: "#0f172a", near: 20, far: 120 }}>
-        <PerspectiveCamera makeDefault position={[0, 15, 16]} />
+        <PerspectiveCamera ref={cameraRef} makeDefault position={[0, 12, 16]} />
         <ambientLight intensity={0.8} />
         <directionalLight position={[10, 20, 10]} intensity={1.5} />
         <Stars radius={150} depth={70} count={2200} factor={4} />
@@ -554,24 +581,11 @@ export default function App() {
             <GroundTile x={c.cx * CHUNK_SIZE} z={c.cz * CHUNK_SIZE} type="street" />
 
             {c.roads.map((r, i) => (
-              <RoadTile
-                key={`r-${i}`}
-                x={r.x}
-                z={r.z}
-                dir={r.dir}
-                type={r.type}
-              />
+              <RoadTile key={`r-${i}`} x={r.x} z={r.z} dir={r.dir} type={r.type} />
             ))}
 
             {c.buildings.map((b, i) => (
-              <Building
-                key={`b-${i}`}
-                x={b.x}
-                z={b.z}
-                w={b.w}
-                d={b.d}
-                h={b.h}
-              />
+              <Building key={`b-${i}`} x={b.x} z={b.z} w={b.w} d={b.d} h={b.h} />
             ))}
 
             {c.npcs.map((n, i) => (
@@ -579,22 +593,40 @@ export default function App() {
             ))}
 
             {c.vehicles.map((v, i) => (
-              <Vehicle key={`v-${i}`} data={v} />
+              <Vehicle
+                key={`v-${i}`}
+                data={v}
+                playerPos={pos}
+                mode={mode}
+                enterVehicle={enterVehicle}
+              />
             ))}
           </group>
         ))}
 
-        <Player
-          position={pos}
-          rotation={rot}
-          moving={!!(input.x || input.y)}
-          running={running}
-        />
+        {mode === "walk" && (
+          <Player
+            position={pos}
+            rotation={rot}
+            moving={!!(input.x || input.y)}
+            running={running}
+          />
+        )}
+
         <GameLoop />
       </Canvas>
 
       <Joystick onInput={setInput} />
       <RunButton setRunning={setRunning} />
+
+      {mode === "drive" && (
+        <div
+          className="absolute top-6 right-6 bg-white/20 backdrop-blur px-4 py-2 rounded-lg text-white"
+          onClick={exitVehicle}
+        >
+          Exit Vehicle
+        </div>
+      )}
     </div>
   );
 }
