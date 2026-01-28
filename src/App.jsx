@@ -426,8 +426,8 @@ useFrame(() => {
         color="#ffffff"
       />
     </group>
-  );
-};
+    } );
+
 // ================= APP =================
 export default function App() {
   const [pos, setPos] = useState([0, 0, 0]);
